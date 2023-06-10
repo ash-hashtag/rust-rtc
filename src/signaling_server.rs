@@ -12,12 +12,16 @@ use webrtc::{
     },
     data::data_channel::DataChannel,
     data_channel::RTCDataChannel,
-    ice_transport::{ice_candidate::RTCIceCandidateInit, ice_server::RTCIceServer},
+    ice_transport::{
+        ice_candidate::RTCIceCandidateInit, ice_credential_type::RTCIceCredentialType,
+        ice_server::RTCIceServer,
+    },
     interceptor::registry::Registry,
     peer_connection::{
         configuration::RTCConfiguration, policy::ice_transport_policy::RTCIceTransportPolicy,
         sdp::session_description::RTCSessionDescription, RTCPeerConnection,
     },
+    stun::textattrs::Realm,
 };
 
 pub struct SignalingServer {
@@ -40,26 +44,57 @@ impl SignalingServer {
             .with_media_engine(m)
             .with_interceptor_registry(registery)
             .build();
+        let use_relay = true;
+        let mut args = std::env::args().skip(1);
+        let username = args.next().expect("username not found");
+        let password = args.next().expect("password not found");
+        println!("user: {username}, pass: {password}");
 
-        let rtc_config = RTCConfiguration {
-            ice_servers: vec![
-                RTCIceServer {
+        let rtc_config = if use_relay {
+            println!("using relay");
+            RTCConfiguration {
+                ice_servers: vec![
+                    RTCIceServer {
+                        urls: vec!["stun:stun.l.google.com:19302".to_owned()],
+                        ..Default::default()
+                    },
+                    RTCIceServer {
+                        urls: vec!["turn:127.0.0.1:3478".to_owned()],
+                        username,
+                        credential: password,
+                        credential_type: RTCIceCredentialType::Password,
+                    },
+                ],
+                ice_transport_policy: RTCIceTransportPolicy::Relay,
+                ..Default::default()
+            }
+        } else {
+            println!("not using relay");
+            RTCConfiguration {
+                ice_servers: vec![RTCIceServer {
                     urls: vec!["stun:stun.l.google.com:19302".to_owned()],
                     ..Default::default()
-                },
-                RTCIceServer {
-                    urls: vec!["turn:127.0.0.1:9696".to_owned()],
-                    ..Default::default()
-                },
-            ],
-            ice_transport_policy: RTCIceTransportPolicy::Relay,
-            ..Default::default()
+                }],
+                ..Default::default()
+            }
         };
         let rtc_peer_conn = api.new_peer_connection(rtc_config).await?;
         let tx = Arc::new(Mutex::new(tx));
         let tx_for_ice_cands = tx.clone();
         let pending_candidates = Arc::new(Mutex::new(Vec::<String>::with_capacity(10)));
         let rtc_peer_conn = Arc::new(rtc_peer_conn);
+
+        {
+            rtc_peer_conn.on_ice_connection_state_change(Box::new(|state| {
+                println!("ICE CONNECTION STATE {}", state);
+                Box::pin(async {})
+            }));
+
+            rtc_peer_conn.on_ice_gathering_state_change(Box::new(|state| {
+                println!("ICE GATHERING STATE {}", state);
+                Box::pin(async {})
+            }));
+        }
         {
             let pending_candidates = pending_candidates.clone();
             let conn_for_ice_cands = rtc_peer_conn.clone();
@@ -213,7 +248,8 @@ impl SignalingServer {
         Ok(())
     }
 
-    pub fn stop_stream(self) {
+    pub async fn stop_stream(self) {
+        self.rtc_peer_conn.close().await;
         drop(self.handle);
     }
 

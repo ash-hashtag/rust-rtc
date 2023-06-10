@@ -6,7 +6,6 @@
   "type": "module",
   "dependencies": {
     "@types/ws": "^8.5.4",
-    "wrtc": "^0.4.7",
     "ws": "^8.13.0"
   }
 }

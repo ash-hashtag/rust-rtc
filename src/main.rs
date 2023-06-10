@@ -28,5 +28,5 @@ async fn main() {
         }
     }
 
-    server.stop_stream();
+    server.stop_stream().await;
 }
