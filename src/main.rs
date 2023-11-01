@@ -5,7 +5,7 @@ use signaling_server::SignalingServer;
 #[tokio::main]
 async fn main() {
     println!("Hello, world!");
-    const WS_URL: &'static str = "ws://localhost:8080";
+    const WS_URL: &'static str = "ws://35.200.208.109:9006";
     let mut server = SignalingServer::new(WS_URL).await.unwrap();
 
     let mut buf = String::with_capacity(128);

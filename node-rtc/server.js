@@ -1,7 +1,8 @@
 import {WebSocketServer} from "ws"
 
 const server = new WebSocketServer({
-  port: 8080,
+  host: '0.0.0.0',
+  port: 9006,
 })
 
 server.on("connection", (socket, _request) => {

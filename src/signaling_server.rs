@@ -4,6 +4,7 @@ use futures::{
     stream::{SplitSink, StreamExt},
     SinkExt,
 };
+use serde::{Deserialize, Serialize};
 use tokio::{net::TcpStream, sync::Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use webrtc::{
@@ -24,12 +25,37 @@ use webrtc::{
     stun::textattrs::Realm,
 };
 
+// #[derive(Deserialize, Serialize)]
+// struct SDPSignal {
+//     sdp: RTCSessionDescription,
+// }
+#[derive(Deserialize, Serialize)]
+struct SDPOfferSignal {
+    offer: RTCSessionDescription,
+}
+#[derive(Deserialize, Serialize)]
+struct SDPAnswerSignal {
+    answer: RTCSessionDescription,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ICECandSignal {
+    ice: RTCIceCandidateInit,
+}
+
 pub struct SignalingServer {
     tx: Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>,
     handle: tokio::task::JoinHandle<()>,
-    pending_candidates: Arc<Mutex<Vec<String>>>,
+    pending_candidates: Arc<Mutex<Vec<RTCIceCandidateInit>>>,
     rtc_peer_conn: Arc<RTCPeerConnection>,
     channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
+}
+
+fn timestamp_now() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
 }
 
 impl SignalingServer {
@@ -44,10 +70,11 @@ impl SignalingServer {
             .with_media_engine(m)
             .with_interceptor_registry(registery)
             .build();
-        let use_relay = true;
         let mut args = std::env::args().skip(1);
         let username = args.next().expect("username not found");
         let password = args.next().expect("password not found");
+        let use_relay = args.next().unwrap_or(String::from("no-relay"));
+        let use_relay = use_relay == "relay";
         println!("user: {username}, pass: {password}");
 
         let rtc_config = if use_relay {
@@ -59,7 +86,7 @@ impl SignalingServer {
                         ..Default::default()
                     },
                     RTCIceServer {
-                        urls: vec!["turn:127.0.0.1:3478".to_owned()],
+                        urls: vec!["turn:35.200.208.109:8080".to_owned()],
                         username,
                         credential: password,
                         credential_type: RTCIceCredentialType::Password,
@@ -81,17 +108,18 @@ impl SignalingServer {
         let rtc_peer_conn = api.new_peer_connection(rtc_config).await?;
         let tx = Arc::new(Mutex::new(tx));
         let tx_for_ice_cands = tx.clone();
-        let pending_candidates = Arc::new(Mutex::new(Vec::<String>::with_capacity(10)));
+        let pending_candidates =
+            Arc::new(Mutex::new(Vec::<RTCIceCandidateInit>::with_capacity(10)));
         let rtc_peer_conn = Arc::new(rtc_peer_conn);
 
         {
             rtc_peer_conn.on_ice_connection_state_change(Box::new(|state| {
-                println!("ICE CONNECTION STATE {}", state);
+                println!("{} ICE CONNECTION STATE {}", timestamp_now(), state);
                 Box::pin(async {})
             }));
 
             rtc_peer_conn.on_ice_gathering_state_change(Box::new(|state| {
-                println!("ICE GATHERING STATE {}", state);
+                println!("{} ICE GATHERING STATE {}", timestamp_now(), state);
                 Box::pin(async {})
             }));
         }
@@ -105,10 +133,9 @@ impl SignalingServer {
                 Box::pin(async move {
                     if let Some(candidate) = x {
                         if conn.remote_description().await.is_some() {
-                            let candidate = candidate.to_json().unwrap().candidate;
-                            let mut text = String::with_capacity(200);
-                            text.push_str("ice:");
-                            text.push_str(&candidate);
+                            let candidate = candidate.to_json().unwrap();
+                            let text =
+                                serde_json::to_string(&ICECandSignal { ice: candidate }).unwrap();
                             println!("sending ws {}", text);
                             let result = tx_for_ice_cands
                                 .lock()
@@ -124,7 +151,7 @@ impl SignalingServer {
                             pending_candidates
                                 .lock()
                                 .await
-                                .push(candidate.to_json().unwrap().candidate);
+                                .push(candidate.to_json().unwrap());
                         }
                     }
                 })
@@ -148,85 +175,227 @@ impl SignalingServer {
                     }
                 } {
                     println!("Received Message {s}");
-                    if s.starts_with("ice:") {
+                    if let Ok(ice) = serde_json::from_str::<ICECandSignal>(&s) {
                         let conn = conn_for_incoming_messages.clone();
                         if conn.remote_description().await.is_none() {
                             continue;
                         }
-                        let candidate = RTCIceCandidateInit {
-                            candidate: String::from(&s[4..]),
-                            ..Default::default()
-                        };
+                        let candidate = ice.ice;
                         if let Err(err) = conn.add_ice_candidate(candidate).await {
                             eprintln!("Error adding ICE Candidate {err}");
                         } else {
                             println!("Added Ice candidate");
                         }
-                    } else if s.starts_with("sdp:") {
-                        let sdp_str = &s[4..];
+                    } else if let Ok(sdp) = serde_json::from_str::<SDPAnswerSignal>(&s) {
                         let mut tx = tx_for_incoming_messages.lock().await;
                         let conn = conn_for_incoming_messages.clone();
                         if conn.local_description().await.is_some() {
-                            conn.set_remote_description(serde_json::from_str(sdp_str).unwrap())
-                                .await
+                            conn.set_remote_description(sdp.answer).await.unwrap();
+                        }
+                        let cands = pending_candidates_for_incoming_messages.lock().await;
+                        for cand in &*cands {
+                            let text = serde_json::to_string(&ICECandSignal { ice: cand.clone() })
                                 .unwrap();
-                        } else {
-                            let channel_clone = channel_clone.clone();
-                            conn.on_data_channel(Box::new(move |channel| {
-                                println!("Received data channel {}", channel.label());
-                                channel.on_open(Box::new(|| {
-                                    println!("data channel opened");
-                                    Box::pin(async {})
-                                }));
-                                {
-                                    let channel_clone = channel_clone.clone();
-                                    channel.on_close(Box::new(move || {
-                                        println!("Data channel closed");
-
-                                        let channel_clone = channel_clone.clone();
-                                        Box::pin(async move {
-                                            *channel_clone.lock().await = None;
-                                        })
-                                    }));
-                                }
-                                channel.on_message(Box::new(|x| {
-                                    let s = String::from_utf8(x.data.to_vec()).unwrap();
-                                    println!("datachannel received {}", s);
-                                    Box::pin(async {})
-                                }));
-                                {
-                                    let channel_clone = channel_clone.clone();
-                                    Box::pin(async move {
-                                        *channel_clone.lock().await = Some(channel.clone());
-                                    })
-                                }
-                            }));
-                            conn.set_remote_description(serde_json::from_str(sdp_str).unwrap())
-                                .await
-                                .unwrap();
-                            let answer = conn.create_answer(None).await.unwrap();
-                            let answer_str = serde_json::to_string(&answer).unwrap();
-                            let mut text = String::with_capacity(512);
-
-                            text.push_str("sdp:");
-                            text.push_str(&answer_str);
 
                             println!("sending ws {}", text);
                             tx.send(Message::Text(text)).await.unwrap();
-
-                            conn.set_local_description(answer).await.unwrap();
                         }
+                        // else {
+                        //     let channel_clone = channel_clone.clone();
+                        //     conn.on_data_channel(Box::new(move |channel| {
+                        //         println!(
+                        //             "{} received data channel {}",
+                        //             timestamp_now(),
+                        //             channel.label()
+                        //         );
+                        //         channel.on_open(Box::new(|| {
+                        //             println!("{} data channel opened", timestamp_now());
+                        //             Box::pin(async {})
+                        //         }));
+                        //         {
+                        //             let channel_clone = channel_clone.clone();
+                        //             channel.on_close(Box::new(move || {
+                        //                 println!("{} data channel closed", timestamp_now());
+
+                        //                 let channel_clone = channel_clone.clone();
+                        //                 Box::pin(async move {
+                        //                     *channel_clone.lock().await = None;
+                        //                 })
+                        //             }));
+                        //         }
+                        //         channel.on_message(Box::new(|x| {
+                        //             let s = String::from_utf8(x.data.to_vec()).unwrap();
+                        //             println!("datachannel received {}", s);
+                        //             Box::pin(async {})
+                        //         }));
+                        //         {
+                        //             let channel_clone = channel_clone.clone();
+                        //             Box::pin(async move {
+                        //                 *channel_clone.lock().await = Some(channel.clone());
+                        //             })
+                        //         }
+                        //     }));
+                        //     conn.set_remote_description(sdp.sdp).await.unwrap();
+                        //     let answer = conn.create_answer(None).await.unwrap();
+                        //     let text = serde_json::to_string(&SDPSignal {
+                        //         sdp: answer.clone(),
+                        //     })
+                        //     .unwrap();
+
+                        //     println!("sending ws {}", text);
+                        //     tx.send(Message::Text(text)).await.unwrap();
+
+                        //     conn.set_local_description(answer).await.unwrap();
+                        // }
+                        // let cands = pending_candidates_for_incoming_messages.lock().await;
+
+                        // for cand in &*cands {
+                        //     let text = serde_json::to_string(&ICECandSignal { ice: cand.clone() })
+                        //         .unwrap();
+
+                        //     println!("sending ws {}", text);
+                        //     tx.send(Message::Text(text)).await.unwrap();
+                        // }
+                    } else if let Ok(sdp) = serde_json::from_str::<SDPOfferSignal>(&s) {
+                        let channel_clone = channel_clone.clone();
+                        let mut tx = tx_for_incoming_messages.lock().await;
+                        let conn = conn_for_incoming_messages.clone();
+                        conn.on_data_channel(Box::new(move |channel| {
+                            println!(
+                                "{} received DATA CHANNEL {}",
+                                timestamp_now(),
+                                channel.label()
+                            );
+                            channel.on_open(Box::new(|| {
+                                println!("{} DATA CHANNEL opened", timestamp_now());
+                                Box::pin(async {})
+                            }));
+                            {
+                                let channel_clone = channel_clone.clone();
+                                channel.on_close(Box::new(move || {
+                                    println!("{} DATA CHANNEL closed", timestamp_now());
+
+                                    let channel_clone = channel_clone.clone();
+                                    Box::pin(async move {
+                                        *channel_clone.lock().await = None;
+                                    })
+                                }));
+                            }
+                            channel.on_message(Box::new(|x| {
+                                let s = String::from_utf8(x.data.to_vec()).unwrap();
+                                println!("datachannel received {}", s);
+                                Box::pin(async {})
+                            }));
+                            {
+                                let channel_clone = channel_clone.clone();
+                                Box::pin(async move {
+                                    *channel_clone.lock().await = Some(channel.clone());
+                                })
+                            }
+                        }));
+                        conn.set_remote_description(sdp.offer).await.unwrap();
+                        let answer = conn.create_answer(None).await.unwrap();
+                        let text = serde_json::to_string(&SDPAnswerSignal {
+                            answer: answer.clone(),
+                        })
+                        .unwrap();
+
+                        println!("sending ws {}", text);
+                        tx.send(Message::Text(text)).await.unwrap();
+
+                        conn.set_local_description(answer).await.unwrap();
+
                         let cands = pending_candidates_for_incoming_messages.lock().await;
 
                         for cand in &*cands {
-                            let mut text = String::with_capacity(512);
-                            text.push_str("ice:");
-                            text.push_str(cand);
+                            let text = serde_json::to_string(&ICECandSignal { ice: cand.clone() })
+                                .unwrap();
 
                             println!("sending ws {}", text);
                             tx.send(Message::Text(text)).await.unwrap();
                         }
                     }
+                    //         if s.starts_with("ice:") {
+                    //             let conn = conn_for_incoming_messages.clone();
+                    //             if conn.remote_description().await.is_none() {
+                    //                 continue;
+                    //             }
+                    //             let candidate = RTCIceCandidateInit {
+                    //                 candidate: String::from(&s[4..]),
+                    //                 ..Default::default()
+                    //             };
+                    //             if let Err(err) = conn.add_ice_candidate(candidate).await {
+                    //                 eprintln!("Error adding ICE Candidate {err}");
+                    //             } else {
+                    //                 println!("Added Ice candidate");
+                    //             }
+                    //         } else if s.starts_with("sdp:") {
+                    //             let sdp_str = &s[4..];
+                    //             let mut tx = tx_for_incoming_messages.lock().await;
+                    //             let conn = conn_for_incoming_messages.clone();
+                    //             if conn.local_description().await.is_some() {
+                    //                 conn.set_remote_description(serde_json::from_str(sdp_str).unwrap())
+                    //                     .await
+                    //                     .unwrap();
+                    //             } else {
+                    //                 let channel_clone = channel_clone.clone();
+                    //                 conn.on_data_channel(Box::new(move |channel| {
+                    //                     println!(
+                    //                         "{} received data channel {}",
+                    //                         timestamp_now(),
+                    //                         channel.label()
+                    //                     );
+                    //                     channel.on_open(Box::new(|| {
+                    //                         println!("{} data channel opened", timestamp_now());
+                    //                         Box::pin(async {})
+                    //                     }));
+                    //                     {
+                    //                         let channel_clone = channel_clone.clone();
+                    //                         channel.on_close(Box::new(move || {
+                    //                             println!("{} data channel closed", timestamp_now());
+
+                    //                             let channel_clone = channel_clone.clone();
+                    //                             Box::pin(async move {
+                    //                                 *channel_clone.lock().await = None;
+                    //                             })
+                    //                         }));
+                    //                     }
+                    //                     channel.on_message(Box::new(|x| {
+                    //                         let s = String::from_utf8(x.data.to_vec()).unwrap();
+                    //                         println!("datachannel received {}", s);
+                    //                         Box::pin(async {})
+                    //                     }));
+                    //                     {
+                    //                         let channel_clone = channel_clone.clone();
+                    //                         Box::pin(async move {
+                    //                             *channel_clone.lock().await = Some(channel.clone());
+                    //                         })
+                    //                     }
+                    //                 }));
+                    //                 conn.set_remote_description(serde_json::from_str(sdp_str).unwrap())
+                    //                     .await
+                    //                     .unwrap();
+                    //                 let answer = conn.create_answer(None).await.unwrap();
+                    //                 let text = serde_json::to_string(&SDPSignal {
+                    //                     sdp: answer.clone(),
+                    //                 })
+                    //                 .unwrap();
+
+                    //                 println!("sending ws {}", text);
+                    //                 tx.send(Message::Text(text)).await.unwrap();
+
+                    //                 conn.set_local_description(answer).await.unwrap();
+                    //             }
+                    //             let cands = pending_candidates_for_incoming_messages.lock().await;
+
+                    //             for cand in &*cands {
+                    //                 let text = serde_json::to_string(&ICECandSignal { ice: cand.clone() })
+                    //                     .unwrap();
+
+                    //                 println!("sending ws {}", text);
+                    //                 tx.send(Message::Text(text)).await.unwrap();
+                    //             }
+                    //         }
                 }
             }
         });
@@ -266,12 +435,12 @@ impl SignalingServer {
         let channel = conn.create_data_channel("data", None).await?;
         *self.channel.lock().await = Some(channel.clone());
         channel.on_open(Box::new(|| {
-            println!("Data Channel opened");
+            println!("{} data Channel opened", timestamp_now());
             Box::pin(async {})
         }));
         let self_channel = self.channel.clone();
         channel.on_close(Box::new(move || {
-            println!("Data channel closed");
+            println!("{} data channel closed", timestamp_now());
             let self_channel = self_channel.clone();
             Box::pin(async move {
                 *self_channel.lock().await = None;
@@ -284,11 +453,8 @@ impl SignalingServer {
             Box::pin(async {})
         }));
         let offer = conn.create_offer(None).await?;
-        let sdp_str = serde_json::to_string(&offer).unwrap();
-        conn.set_local_description(offer).await.unwrap();
-        let mut text = String::with_capacity(512);
-        text.push_str("sdp:");
-        text.push_str(&sdp_str);
+        conn.set_local_description(offer.clone()).await.unwrap();
+        let text = serde_json::to_string(&SDPOfferSignal { offer }).unwrap();
         println!("sending ws {}", text);
         self.tx.lock().await.send(Message::Text(text)).await?;
         Ok(())
